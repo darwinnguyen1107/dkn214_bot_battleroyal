@@ -291,7 +291,7 @@ class NavGrid:
 
 
 class Bot:
-    name = "Darwin Survivor v2"
+    name = "Darwin Second Wind"
 
     def __init__(self, hello: mf.Hello):
         cfg = hello["config"]
@@ -321,12 +321,18 @@ class Bot:
         self.strafe_until = 0
 
     # ------------------------------------------------------------------ helpers
-    def choose_upgrade(self, offer):
+    def choose_upgrade(self, offer, hp_ratio=1.0, has_secondary=False):
         choices = offer.get("choices", [])
         terms = [("armor", 100), ("repair", 95), ("regen", 90), ("health", 85), ("hp", 85),
                  ("speed", 70), ("energy", 65), ("shield", 60), ("sensor", 55)]
 
+        preferred = {"armor": 101, "plating": 98, "nanites": 104 if hp_ratio < 0.65 else 89,
+                     "gun_damage": 95 if not has_secondary else 81, "gun_rate": 80,
+                     "gun_mag": 79, "laser_damage": 84, "lightning_range": 84}
+
         def priority(c):
+            if c.get("id") in preferred:
+                return preferred[c["id"]]
             s = (c.get("id", "") + " " + c.get("name", "") + " " + c.get("desc", "")).lower()
             return max([sc for word, sc in terms if word in s] or [10])
         return max(range(len(choices)), key=lambda i: priority(choices[i])) if choices else None
@@ -470,7 +476,7 @@ class Bot:
 
         offer = obs.get("offer")
         if offer:
-            pick = self.choose_upgrade(offer)
+            pick = self.choose_upgrade(offer, hp_ratio, weapons[1] is not None)
             if pick is not None:
                 action["pick"] = pick
 
@@ -619,9 +625,22 @@ class Bot:
                      for w in weapons if w and w["kind"] in default_ranges), default=0)
         gun, second = weapons[0], weapons[1]
         tgt = None
-        if enemy and enemy_dist < reach:
+        # Keep movement keyed to the closest mech. Aim at the closest one
+        # with a clear firing lane; remembered targets can be behind walls.
+        for contact in enemies:
+            if distance(pos, contact["pos"]) >= reach:
+                break
+            height = 4.5 * (1 + 0.05 * contact.get("cubes", 0))
+            target_pos = contact["pos"]
+            if self.nav and not self.nav.shot_clear(
+                (x, y, muzzle_z), (*target_pos[:2], target_pos[2] + height)
+            ):
+                continue
+            tgt = (contact, height, True)
+            break
+        if tgt is None and enemy and enemy_dist < reach:
             tgt = (enemy, 4.5 * (1 + 0.05 * enemy.get("cubes", 0)), True)
-        elif farm and farm[0] < 90:
+        elif tgt is None and farm and farm[0] < 90:
             tgt = (farm[1], farm[2], False)
 
         if tgt:
@@ -654,7 +673,10 @@ class Bot:
             if gun and gun["kind"] == "gun":
                 gun_range = gun["stats"].get("range", 230) if is_mech else 90
                 action["fire"][0] = bool(aligned and clear and dist < gun_range and gun.get("ammo", 1) > 0)
-                if gun.get("ammo", 1) == 0 and gun.get("reload", 0) <= 0:
+                can_top_up = (is_mech and not clear and enemy_dist > 60 and not urgent
+                              and tick - self.damage_tick > 40 and tick - self.listen_tick > 40
+                              and gun.get("ammo", 1) <= gun["stats"].get("mag", 12) // 2)
+                if (gun.get("ammo", 1) == 0 or can_top_up) and gun.get("reload", 0) <= 0:
                     action["reload"] = True
             if is_mech and second and second.get("cooldown", 0) <= 0 and clear:
                 kind, st = second["kind"], second["stats"]
