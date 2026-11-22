@@ -1,0 +1,70 @@
+Darwin Century Atlas
+
+INSTALL
+Extract this archive at the submitting repository root. The Dockerfile, three bot
+modules, mechfight.py, and atlas-*.bin belong beside one another. The entry point
+is code_ver10.py. The two developer tools and this guide are optional uploads.
+The baseline was the local Darwin Century source, SHA-256
+ef3885a5e1cbf4ac40f5c8d83c79340443340836d8d5097685959ff7a64b4023.
+
+RUNTIME
+The included binary grid was generated from the kit arena/v2 terrain and prisms.
+Its filename is determined from a format version, byte order and both source
+files. A map change triggers a rebuild and an atomic cache write under /tmp.
+The container requires only standard-library Python. NumPy is optional for
+rasterization, long ground checks, and larger projectile fields. Grid geometry
+approximates the arena at 3 m resolution. Mortar predictions sample that grid.
+The decision timer reserves time for final actions. 50 ms conformance and
+performance on the grading machine have not been measured.
+
+PRIORITIES
+Urgent ring movement can interrupt looting, farming and posting. A dodge on an
+urgent route must make inward progress. During a fight, charging lasers and a
+two-sided pinch can interrupt ordinary strafing. Low health, sustained damage,
+disabling effects and the top-three bubble increase defensive play. With safe
+timing, the bot can hold a covered angle, gate a late entrant, capture a pad, or
+collect nearby cubes. Farms need a quiet window. The last duel disables farming,
+settling on the passive ring, and post-kill pauses.
+
+MECHANIC ADAPTATIONS
+* Sound bands and bearings are noisy and anonymous. Intersections, inferred
+  skirmishes, occlusion and corner pre-aims are estimates. A visible beam ending
+  near another mech can flag a target. Practice enemies never attack each other.
+  Visible cube counts supply the boss estimate. No global kill feed is exposed.
+* A held laser fires on release or expiry. Precharging slows movement and may
+  reveal the bot. There is no cancel action or special headshot multiplier.
+* Gun spread is constant per shot. Tighter long-range alignment and an ammo
+  threshold conserve shots. Gun fire resumes while a secondary cools down.
+* Lightning chains between targets. Nearby crates or NPCs can serve as a first
+  link. Walls obstruct arcs. Bodies and crates offer situational protection.
+* Dropping leaves a weapon at the player's feet. Denial means retaining a
+  contested pickup or swapping it. A poor secondary may be dropped immediately
+  before a verified, nearby upgrade. Perks are read from actual owned upgrades.
+* Storm damage calculations estimate travel and capture time. A shrinking circle,
+  movement interference, new fire or an interrupted capture can invalidate them.
+  Only the announced circle is known. Upper surfaces and overhangs are approximated
+  from map prisms. Learned obstruction memory and pickup history are bounded.
+* Cover peeks, turret turn estimates, projectile evasion and NPC kiting operate
+  at observation intervals. They cannot guarantee a return within 0.3 s, a clean
+  shot, zero chip damage, exact impact time, or a private leaderboard score.
+
+DEVELOPER TOOLS
+Set ATLAS_DEBUG=1 to enable bounded JSONL telemetry at /tmp/century-trace.jsonl
+and mortar impact debug markers. Ordinary runs have telemetry disabled.
+ATLAS_USE_NAV, ATLAS_SETTLE, ATLAS_STRAFE, ATLAS_FARM, and ATLAS_DROPS select
+the five original strategy flags (1 on, 0 off). Main tuning knobs are in
+arena_nav.CONFIG. Some Century-specific heuristics still live beside their users.
+
+test_geometry.py contains standalone unittest cases for polygon geometry, walking,
+bridge sightlines, mortar solutions and projectile dodging. To run them locally,
+use python -m unittest test_geometry from the extracted folder.
+
+paired_runs.py expects a separate match runner. The public kit here supplies a
+conformance checker, not a scored simulator. Example adapter invocation:
+python paired_runs.py --seeds 11,12,13 --disable FARM -- python local_runner.py --seed {seed}
+The adapter must launch a fresh match on the requested seed, forward ATLAS_*
+environment variables into the bot process, keep the map, player slot and opposing
+squad paired across variants, and print the bot's JSON end message to stdout.
+A = all five flags enabled; B = selected flags disabled. Placement 1 is best.
+The harness reports both means, per-seed pairs, ties and paired placement gains.
+No tests, matches or leaderboard submissions were run when preparing this build.
