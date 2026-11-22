@@ -291,7 +291,7 @@ class NavGrid:
 
 
 class Bot:
-    name = "Darwin Adaptive 70"
+    name = "Darwin Aftermath"
 
     def __init__(self, hello: mf.Hello):
         cfg = hello["config"]
@@ -313,16 +313,9 @@ class Bot:
         self.pi = 0
         self.path_goal = None
         self.plan_tick = -999
-        self.last_hit_id = None
-        self.last_hit_time = -100.
-        self.rear_time = -100.
-        self.failed_pickups = {}
-        self.reload_sound = self.jet_sound = None
-        self.reload_time = self.jet_time = -100.
-        self.zone_key = None
-        self.recovering = False
-        self.post = self.post_key = None
-        self.post_tick = -100
+        self.recent_contacts = {}
+        self.kill_site = None
+        self.aftermath_until = -1.0
         self.focus_id = None
         self.attacker = None
         self.step_bearing = None
@@ -338,7 +331,7 @@ class Bot:
         self.strafe_until = 0
 
     # ------------------------------------------------------------------ helpers
-    def choose_upgrade(self, offer, hp_ratio=1.0, has_secondary=False, bonuses=None):
+    def choose_upgrade(self, offer, hp_ratio=1.0, has_secondary=False):
         choices = offer.get("choices", [])
         terms = [("armor", 100), ("repair", 95), ("regen", 90), ("health", 85), ("hp", 85),
                  ("speed", 70), ("energy", 65), ("shield", 60), ("sensor", 55)]
@@ -348,8 +341,6 @@ class Bot:
                      "gun_mag": 79, "laser_damage": 84, "lightning_range": 84}
 
         def priority(c):
-            if bonuses and c.get("id") in bonuses:
-                return bonuses[c["id"]]
             if c.get("id") in preferred:
                 return preferred[c["id"]]
             s = (c.get("id", "") + " " + c.get("name", "") + " " + c.get("desc", "")).lower()
@@ -389,7 +380,7 @@ class Bot:
                 safe = [v for v in safe if self.nav.walk_clear((x,y), (x+10*v[0], y+10*v[1]))]
             if safe:
                 direction = max(safe, key=lambda v: (
-                    -(dx * v[0] + dy * v[1]) + 0.2*(mx*v[0]+my*v[1]), -distance((x + 10 * v[0], y + 10 * v[1]), center)))
+                    -(dx * v[0] + dy * v[1]), -distance((x + 10 * v[0], y + 10 * v[1]), center)))
                 earliest = t
         return direction
 
@@ -444,35 +435,6 @@ class Bot:
             T = min(3.5, d / (speed * math.cos(pitch)))
             yaw = math.atan2(py - sy, px - sx)
         return yaw, pitch, T
-
-    def select_post(self, pos, enemy, center, limit, hurt):
-        nav = self.nav
-        x,y,z = pos
-        ex,ey,ez = enemy["pos"]
-        best, best_score = None, 0
-        for radius in (0, 9, 18):
-            for dx,dy,norm in (NEIGH if radius else [(0,0,1)]):
-                spot = (x+radius*dx/norm,y+radius*dy/norm)
-                if distance(spot,center)>limit or (radius and not nav.walk_clear(pos,spot)):
-                    continue
-                eye = (*spot,nav.ground(*spot)+7)
-                clear = nav.shot_clear(eye,(ex,ey,ez+4.5))
-                if hurt:
-                    score = 8 * (not clear)
-                else:
-                    if not clear:
-                        continue
-                    back = math.atan2(spot[1]-ey,spot[0]-ex)
-                    shield = 0
-                    for offset in (-0.5,0,0.5):
-                        px = spot[0]+20*math.cos(back+offset)
-                        py = spot[1]+20*math.sin(back+offset)
-                        shield += not nav.shot_clear(eye,(px,py,nav.ground(px,py)+7))
-                    score = shield if shield >= 2 else 0
-                score -= radius/25
-                if score > best_score:
-                    best,best_score = spot,score
-        return best
 
     def should_flee(self, me, enemy, enemies, hp_ratio, held):
         max_hp = max(1, me["max_hp"])
@@ -538,24 +500,23 @@ class Bot:
         enemy_dist = distance(pos, enemy["pos"]) if enemy else float("inf")
         action = {"tick": tick, "fire": [False, False]}
 
-        self.failed_pickups = {i: expiry for i, expiry in self.failed_pickups.items() if expiry > t}
+        # The kill event carries an ID. Keep a short observation history so
+        # the location is available even if the mech has already disappeared.
+        for e in enemies:
+            self.recent_contacts[e["id"]] = (t, tuple(e["pos"]))
+        self.recent_contacts = {i: entry for i, entry in self.recent_contacts.items()
+                                if t - entry[0] <= 2.0}
         for event in obs.get("events", []):
-            if event.get("type") == "hit":
-                self.last_hit_id, self.last_hit_time = event.get("target"), t
-            elif event.get("type") == "take_failed":
-                self.failed_pickups[event.get("id")] = t + (5 if event.get("reason") == "gone" else 0.6)
+            if event.get("type") == "kill":
+                contact = self.recent_contacts.pop(event.get("target"), None)
+                self.kill_site = contact[1] if contact else None
+                self.aftermath_until = t + 7.0
             if event.get("type") == "damaged" and event.get("bearing") is not None:
                 self.damage_bearing = event["bearing"]
                 self.damage_tick = tick
                 self.attacker = event.get("by")
-                if event.get("rear"):
-                    self.rear_time = t
         for s in obs.get("sounds", []):
             heard_at = t - s.get("age", 0)
-            if s.get("kind") == "reload" and heard_at > self.reload_time:
-                self.reload_time, self.reload_sound = heard_at, s["bearing"]
-            if s.get("kind") in ("jet","boost") and heard_at > self.jet_time:
-                self.jet_time, self.jet_sound = heard_at, s["bearing"]
             if s.get("kind") == "step" and heard_at > self.step_time:
                 self.step_time, self.step_bearing = heard_at, s["bearing"]
             if (s.get("kind") in ("gun", "laser", "laser_charge", "lightning", "mortar", "explosion")
@@ -565,25 +526,14 @@ class Bot:
 
         offer = obs.get("offer")
         if offer:
-            bonuses = {}
-            if enemy and abs(wrap(math.atan2(enemy["pos"][1]-y, enemy["pos"][0]-x)-me["aim"][0])) > 1:
-                bonuses["gyros"] = 99
-            if not me.get("in_zone", True):
-                bonuses["servos"] = 106
-            if weapons[0] and weapons[0].get("ammo", 12) <= 2:
-                bonuses["gun_mag"] = 98
-            if "lightning" in held and energy < 40:
-                bonuses["lightning_efficiency"] = 102
-            if "mortar" in held and len(enemies) >= 2 and distance(enemies[0]["pos"], enemies[1]["pos"]) < 16:
-                bonuses["mortar_splash"] = 103
-            pick = self.choose_upgrade(offer, hp_ratio, weapons[1] is not None, bonuses)
+            pick = self.choose_upgrade(offer, hp_ratio, weapons[1] is not None)
             if pick is not None:
                 action["pick"] = pick
 
         votes = {kind: sum(distance(pos, e["pos"]) <= 150 and beaten in e.get("weapons", [])
                            for e in enemies) for kind, beaten in BEATS.items()}
         second = weapons[1]
-        pickups = [p for p in obs.get("pickups", []) if p["id"] not in self.failed_pickups and p["kind"] in votes and p["kind"] not in held
+        pickups = [p for p in obs.get("pickups", []) if p["kind"] in votes and p["kind"] not in held
                    and abs(z - p["pos"][2]) < 3.5 and (not second or
                    (not second.get("charge") and votes[p["kind"]] > votes.get(second["kind"], 0)))]
         nearby = [p for p in pickups if distance(pos, p["pos"]) < self.pickup_radius]
@@ -596,24 +546,11 @@ class Bot:
 
         # ---- zone: time-aware urgency instead of "always sprint to the next center"
         d_next = distance(pos, next_center)
-        safe_r = max(0.0, next_radius - min(25.0, next_radius * 0.3))
+        safe_r = max(8.0, next_radius - 25.0)
         outside_now = (not me.get("in_zone", True)) or distance(pos, center) > radius - 12
         need_t = max(0.0, d_next - safe_r) / walk
         tts = zone.get("shrink_start", 1e9) - t
-        phase = (tuple(next_center), next_radius)
-        if phase != self.zone_key:
-            self.zone_key = phase
-            self.escape_until = -1
-            self.path = []
-            self.plan_tick = -999
-        if self.nav and d_next > safe_r and not self.nav.walk_clear(pos, next_center):
-            need_t *= 1.45
-        start = max(t, zone.get("shrink_start", t))
-        end = zone.get("shrink_end", start)
-        f = min(1., max(0., t+3-start) / max(0.001, end-start))
-        forecast = [a+(b-a)*f for a,b in zip(center,next_center)]
-        boundary_soon = distance(pos, forecast) > radius + f*(next_radius-radius)
-        urgent = boundary_soon or outside_now or (d_next > safe_r and (tts <= 0 or tts < need_t * 1.3 + 12))
+        urgent = outside_now or (d_next > safe_r and (tts <= 0 or tts < need_t * 1.3 + 12))
 
         # Resting spot: a ring inside the next zone, away from the crowd at its center.
         hold_r = max(0.0, 0.55 * next_radius - 10.0) if (SETTLE and next_radius > 60) else 0.0
@@ -623,12 +560,6 @@ class Bot:
             k = hold_r / d_next if d_next > 0.001 else 0.0
             goal = (next_center[0] + (x - next_center[0]) * k, next_center[1] + (y - next_center[1]) * k)
 
-        if goal and not urgent and enemy and hold_r > 10:
-            # Shift the resting point away from the nearest visible contact.
-            ax, ay = unit(goal[0]-enemy["pos"][0], goal[1]-enemy["pos"][1])
-            alternative = (goal[0]+12*ax, goal[1]+12*ay)
-            if distance(alternative,next_center) <= safe_r:
-                goal = alternative
         pursuing = None
         if DROPS and not urgent and enemy_dist > 90:
             best_drop = None
@@ -647,12 +578,7 @@ class Bot:
                 # A landed drop restores full health. Finish a nearby capture
                 # while wounded, but keep the usual health gate for travel.
                 lands_in = dr.get("lands_in", 0)
-                midpoint = ((x+dr["pos"][0])/2, (y+dr["pos"][1])/2)
-                if not inside and any(distance(e["pos"],midpoint)<45 for e in enemies):
-                    continue
-                if not inside and tick-self.damage_tick < 30:
-                    continue
-                if hp_ratio <= 0.5 and not (dd <= radius_to_hold+12 and lands_in <= 0):
+                if hp_ratio <= 0.5 and not (inside and lands_in <= 0):
                     continue
                 if lands_in > dd / walk + 6:
                     continue
@@ -660,8 +586,6 @@ class Bot:
                 progress = dr.get("progress", 0) if holder == my_id else 0.0
                 capture_left = max(0.0, dr.get("capture_s", 4) - progress)
                 finish = max(travel, lands_in) + capture_left
-                if d_next > safe_r and finish + need_t + 3 > tts:
-                    continue
                 if finish < best_time:
                     best_time = finish
                     best_drop = dr
@@ -670,86 +594,73 @@ class Bot:
                 drop_pos = best_drop["pos"]
                 inside = distance(pos, drop_pos) <= max(0.0, best_drop.get("radius", 8) - 2)
                 goal = None if inside else (drop_pos[0], drop_pos[1])
-        if pursuing is None and not urgent and hp_ratio > 0.55 and enemy_dist > 75:
+        # Only interrupt normal looting briefly, and only for a confirmed kill.
+        aftermath = t < self.aftermath_until
+        safe_pause = (aftermath and not urgent and enemy_dist > 100
+                      and tick - self.damage_tick > 20 and not obs.get("projectiles")
+                      and t - self.step_time > 1 and tick - self.listen_tick > 15)
+        if safe_pause and pursuing is None and self.kill_site and self.nav is not None:
+            cubes = [cube["pos"] for cube in obs.get("cubes", [])
+                     if distance(cube["pos"], self.kill_site) <= 12
+                     and distance(pos, cube["pos"]) <= 32
+                     and abs(z - cube["pos"][2]) < 3.5
+                     and distance(cube["pos"], next_center) < safe_r
+                     and self.nav.walk_clear(pos, cube["pos"])]
+            if cubes:
+                # Prefer a pickup that brings several cubes within collection range.
+                def haul_value(point):
+                    count = sum(distance(point, other) <= self.cube_radius for other in cubes)
+                    return distance(pos, point) / count
+                goal = min(cubes, key=haul_value)[:2]
+                pursuing = "salvage"
+        if pursuing is None and not aftermath and not urgent and hp_ratio > 0.55 and enemy_dist > 75:
             cands = []
             for cube in obs.get("cubes", []):
                 d = distance(pos, cube["pos"])
                 if d < 90 and abs(z - cube["pos"][2]) < 3.5 and distance(cube["pos"], next_center) < safe_r:
-                    if d / walk + need_t + 3 > tts and d_next > safe_r:
-                        continue
-                    if me.get("cubes",0) >= 10 and d > 24:
-                        continue
-                    cluster = sum(distance(cube["pos"], other["pos"]) <= 8
-                                  for other in obs.get("cubes", [])[:64])
-                    danger = any(distance(e["pos"],cube["pos"]) < 75 for e in enemies)
-                    priority_distance = d / (1 + 0.25*min(3,max(0,cluster-1))) + 35*danger
+                    priority_distance = d
                     if me.get("cubes", 0) + 1 in self.upgrade_thresholds:
                         priority_distance *= 0.55
                     cands.append((priority_distance, cube["pos"]))
-            if pickups:
+            if weapons[1] is None:
                 for item in pickups:
                     d = distance(pos, item["pos"])
                     if d < 90 and distance(item["pos"], next_center) < safe_r:
-                        cands.append((d + 8 - min(15, 5*votes[item["kind"]]), item["pos"]))
+                        cands.append((d + 8, item["pos"]))
             if cands:
                 goal = min(cands, key=lambda c: c[0])[1][:2]
                 pursuing = "loot"
         farm = None
-        if FARM and tick-self.listen_tick > 30 and t-self.step_time > 1.0 and pursuing is None and not urgent and hp_ratio > 0.7 and enemy_dist > 100:
+        if FARM and not aftermath and pursuing is None and not urgent and hp_ratio > 0.7 and enemy_dist > 100:
             best = None
             for n in npcs:
-                if sum(distance(n["pos"], other["pos"]) < 30 for other in npcs) > 1:
-                    continue
                 d = distance(pos, n["pos"])
                 if d < 55 and abs(z - n["pos"][2]) < 6 and (best is None or d < best[0]):
                     best = (d, n, 1.75)
             for c in obs.get("crates", []):
                 d = distance(pos, c["pos"])
-                if d >= 40 or (self.nav and not self.nav.shot_clear((x,y,muzzle_z),(*c["pos"][:2],c["pos"][2]+1.5))):
-                    continue
-                value = d - (8 if c.get("hp",300) < 150 else 0)
-                if c["id"] == self.last_hit_id and t-self.last_hit_time < 1:
-                    value -= 10
                 if (d < 40 and abs(z - c["pos"][2]) < 6
-                        and (best is None or value < best[0] or
+                        and (best is None or d < best[0] or
                              (not weapons[1] and best[1].get("kind") == "npc" and d < best[0] + 12))):
-                    best = (value, c, 1.5)
+                    best = (d, c, 1.5)
             if best and distance(best[1]["pos"], next_center) < safe_r:
                 farm = best
                 pursuing = "farm"
                 goal = (best[1]["pos"][0], best[1]["pos"][1]) if best[0] > 32 else None
 
-        if hp_ratio < 0.50:
-            self.recovering = True
-        elif hp_ratio > 0.78:
-            self.recovering = False
-        posting = False
-        if enemy and enemy_dist > 35 and not urgent and not pursuing and self.nav and abs(z-self.nav.ground(x,y)) < 2:
-            key = (phase,enemy["id"],self.recovering)
-            if key != self.post_key or tick-self.post_tick >= 18:
-                self.post = self.select_post(pos,enemy,next_center,safe_r,self.recovering)
-                self.post_tick,self.post_key = tick,key
-            if self.post and not self.nav.walk_clear(pos,self.post) and distance(pos,self.post)>2:
-                self.post = None
-                self.post_tick = tick-16
-            if self.post:
-                posting = True
-                goal = self.post if distance(pos,self.post)>2 else None
-        else:
-            self.post_key = None
         gx, gy = (0.0, 0.0) if goal is None else self.steer(pos, goal, tick)
 
         # ---- fight / flee / strafe
         engaged = enemy is not None and enemy_dist < 170
         fighting_move = False
         mx, my = gx, gy
-        if engaged and not urgent and not posting:
+        if engaged and not urgent:
             ex, ey = enemy["pos"][0], enemy["pos"][1]
             ax, ay = unit(x - ex, y - ey)
             sx, sy = -ay, ax
             if tick >= self.strafe_until:
                 self.strafe_sign = -self.strafe_sign
-                self.strafe_until = tick + (self.rng.randint(5,10) if tick-self.damage_tick < 40 else self.rng.randint(14,24))
+                self.strafe_until = tick + self.rng.randint(6, 14)
             sign = self.strafe_sign
             if self.nav is not None and not self.nav.walk_clear((x, y), (x + sx * sign * 10, y + sy * sign * 10)):
                 sign = -sign
@@ -861,17 +772,7 @@ class Bot:
         action["move"] = [gx, gy]
         action["boost"] = bool((energy > 45 and (dodge or outside_now or (urgent and d_next > 90)))
                                or (escaping and energy > 35))
-        if fighting_move and energy > 82 and enemy_dist < 85 and me.get("grounded",True) and (gx or gy):
-            action["boost"] = True
-        if pursuing == "drop" and goal and distance(pos,goal)>25 and energy>85 and enemy_dist>120:
-            action["boost"] = True
-        if "lightning" in held and energy < 52 and not urgent and not dodge and not escaping:
-            action["boost"] = False
-        ledge = False
-        if self.nav and (gx or gy) and not escaping and energy>55:
-            cell = self.nav.cell_of(x+4*gx,y+4*gy)
-            ledge = cell is not None and z+1.2 < self.nav.top[cell] < z+4
-        action["jump"] = bool(me.get("grounded", True) and (escaping or ledge))
+        action["jump"] = bool(me.get("grounded", True) and escaping)
 
         # ---- aim and fire
         default_ranges = {"gun": 230, "laser": 280, "lightning": 45}
@@ -894,16 +795,6 @@ class Bot:
             d = distance(pos, target_pos)
             hp = contact.get("hp")
             cost = (hp if hp is not None else 1000) / 45 + d / 35
-            bearing = math.atan2(target_pos[1]-y,target_pos[0]-x)
-            cost += 2*abs(wrap(bearing-me["aim"][0]))
-            if "aim" in contact and abs(wrap(contact["aim"][0]-bearing)) < math.pi/2:
-                cost -= 3
-            if hp is not None and gun and hp <= gun["stats"].get("damage",45):
-                cost -= 8
-            if contact["id"] == self.last_hit_id and t-self.last_hit_time < 1.5:
-                cost -= 3
-            if "mortar" in held:
-                cost -= 2 * min(3,sum(e["id"] != contact["id"] and distance(e["pos"],target_pos)<7 for e in enemies))
             if contact["id"] == self.focus_id:
                 cost -= 3
             if contact["id"] == self.attacker and tick-self.damage_tick < 30:
@@ -947,38 +838,30 @@ class Bot:
             clear = True
             if self.nav is not None and dist > 15:
                 clear = self.nav.shot_clear((x, y, muzzle_z), (tp[0], tp[1], tp[2] + h))
-            healing = (self.recovering and me.get("in_zone", True) and enemy_dist > 85
+            healing = (hp_ratio < 0.55 and me.get("in_zone", True) and enemy_dist > 85
                        and tick-self.damage_tick > 30 and not outside_now and
                        not (is_mech and obj.get("charging")))
+            recovering_after_kill = (safe_pause and hp_ratio < 0.78 and is_mech
+                                     and not obj.get("charging") and not action["boost"])
+            healing = healing or recovering_after_kill
             if gun and gun["kind"] == "gun":
                 gun_range = gun["stats"].get("range", 230) if is_mech else 90
                 action["fire"][0] = bool(not healing and aligned and clear and dist < gun_range and gun.get("ammo", 1) > 0)
-                if gun.get("ammo",12) <= 2 and dist > 80 and abs(yaw_err) > 0.025:
-                    action["fire"][0] = False
                 can_top_up = (is_mech and not clear and enemy_dist > 60 and not urgent
                               and tick - self.damage_tick > 40 and tick - self.listen_tick > 40
                               and gun.get("ammo", 1) <= gun["stats"].get("mag", 12) // 2)
+                if safe_pause and not action["fire"][0] and not clear:
+                    can_top_up = gun.get("ammo", 1) < gun["stats"].get("mag", 12)
                 if (gun.get("ammo", 1) == 0 or can_top_up) and gun.get("reload", 0) <= 0:
                     action["reload"] = True
             if not healing and is_mech and second and second.get("cooldown", 0) <= 0 and clear:
                 kind, st = second["kind"], second["stats"]
                 if kind == "lightning":
                     near_aim = abs(yaw_err) < 0.2
-                    for obstacle in obs.get("crates", []) + npcs:
-                        ox,oy = obstacle["pos"][:2]
-                        if distance(pos,obstacle["pos"]) < dist and abs(wrap(math.atan2(oy-y,ox-x)-me["aim"][0])) < 0.2:
-                            near_aim = False
-                            break
-                    action["fire"][1] = bool(near_aim and dist < st.get("range", 45) - 2 and energy > (8 if obj.get("charging") else 20))
+                    action["fire"][1] = bool(near_aim and dist < st.get("range", 45) - 2 and energy > 20)
                 elif kind == "mortar" and 25 < dist < 210:
                     arc = self.lob(x, y, muzzle_z + 2.5, (tp[0], tp[1], tp[2]+h),
                                    tv, st.get("speed", 72), self.mortar_g)
-                    if arc:
-                        impact_delay = arc[2]
-                        predicted_self = (x+me["vel"][0]*impact_delay,y+me["vel"][1]*impact_delay)
-                        predicted_target = (tp[0]+tv[0]*impact_delay,tp[1]+tv[1]*impact_delay)
-                        if distance(predicted_self,predicted_target) < st.get("splash_radius",7)+5:
-                            arc = None
                     if arc:
                         yaw, pitch, _ = arc
                         action["aim"] = [yaw, pitch]
@@ -987,8 +870,6 @@ class Bot:
                 elif kind == "laser" and dist < st.get("range", 280):
                     fraction = 0.72
                     target_hp = obj.get("hp")
-                    if target_hp and "mortar" in obj.get("weapons",[]):
-                        target_hp /= 1.6
                     if target_hp and target_hp <= st.get("damage", 315) * st.get("min_frac", 0.35):
                         fraction = 0.0
                     release_at = max(st.get("min_charge", 0.15), fraction * st.get("charge", 1))
@@ -999,10 +880,6 @@ class Bot:
                 yaw = self.damage_bearing
             elif self.listen_bearing is not None and tick - self.listen_tick < 15:
                 yaw = self.listen_bearing
-            elif t-self.reload_time < 1.2:
-                yaw = self.reload_sound
-            elif t-self.jet_time < 0.9:
-                yaw = self.jet_sound
             elif self.step_bearing is not None and t-self.step_time < 0.8:
                 yaw = self.step_bearing
             elif gx or gy:
@@ -1010,10 +887,8 @@ class Bot:
             else:
                 yaw = (tick * 0.025) % (2 * math.pi) - math.pi
             action["aim"] = [yaw, 0.0]
-            if gun and gun["kind"] == "gun" and (t-self.step_time > 1 or gun.get("ammo",0)==0) and gun.get("ammo", 1) < gun["stats"].get("mag", 12):
+            if gun and gun["kind"] == "gun" and gun.get("ammo", 1) < gun["stats"].get("mag", 12):
                 action["reload"] = True
-        if t-self.rear_time < 0.65 and self.damage_bearing is not None and not any(action["fire"]):
-            action["aim"] = [self.damage_bearing, 0.0]
         return action
 
 
