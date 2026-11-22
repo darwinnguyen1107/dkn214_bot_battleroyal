@@ -291,7 +291,7 @@ class NavGrid:
 
 
 class Bot:
-    name = "Darwin Second Wind"
+    name = "Darwin Range Guard"
 
     def __init__(self, hello: mf.Hello):
         cfg = hello["config"]
@@ -573,13 +573,38 @@ class Bot:
                     mx, my = unit(next_center[0] - x, next_center[1] - y)
                 fighting_move = True
             elif STRAFE and enemy_dist < 150:
-                away_w = 0.6 if enemy_dist < 30 else (-0.3 if enemy_dist > 100 else 0.0)
+                # Choose spacing from both loadouts. Keep the gun useful while
+                # denying an enemy arc; close only for our own usable arc.
+                their_weapons = enemy.get("weapons", [])
+                own_arc = weapons[1] and weapons[1]["kind"] == "lightning" and energy > 25
+                if own_arc and hp_ratio > 0.65 and len(enemies) == 1 and "mortar" not in their_weapons:
+                    arc_range = weapons[1]["stats"].get("range", 45)
+                    low, high = 0.55 * arc_range, 0.85 * arc_range
+                elif "lightning" in their_weapons:
+                    low, high = 65, 125
+                else:
+                    low, high = 45, 115
+                away_w = 0.85 if enemy_dist < low else (-0.65 if enemy_dist > high else 0.0)
                 mx, my = unit(0.9 * sx * sign + away_w * ax + 0.15 * gx,
                               0.9 * sy * sign + away_w * ay + 0.15 * gy)
                 if distance((x + mx * 12, y + my * 12), next_center) > max(5, next_radius - 10):
                     cx_, cy_ = unit(next_center[0] - x, next_center[1] - y)
                     mx, my = unit(mx + cx_, my + cy_)
                 fighting_move = True
+        # Check the combined strafe/retreat direction after adding radial motion.
+        if fighting_move and self.nav and abs(z - self.nav.ground(x, y)) < 2:
+            end = (x + 8 * mx, y + 8 * my)
+            if not self.nav.walk_clear((x, y), end):
+                heading = math.atan2(my, mx)
+                mx = my = 0.0
+                for offset in (0.55, -0.55, 1.1, -1.1, 1.65, -1.65, math.pi):
+                    vx, vy = math.cos(heading + offset), math.sin(heading + offset)
+                    end = (x + 8 * vx, y + 8 * vy)
+                    if (distance(end, center) <= radius and
+                            distance(end, next_center) <= max(d_next, safe_r) and
+                            self.nav.walk_clear((x, y), end)):
+                        mx, my = vx, vy
+                        break
         gx, gy = mx, my
 
         dodge = None
